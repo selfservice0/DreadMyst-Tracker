@@ -60,6 +60,12 @@ struct SharedTrackerData {
 
   // Debug text for displaying probed buffer values
   char debugText[512]{};
+
+  // Chat filter settings (set by GUI, read by DLL)
+  bool chatFilterEnabled{false};
+  char chatFilterTerms[512]{};  // Comma-separated filter terms
+  bool blockLinkedItems{false}; // Block messages containing item links
+  bool useRegexFilter{false}; // Use regex matching instead of simple substring
 };
 
 namespace DreadmystTracker {

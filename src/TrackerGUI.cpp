@@ -108,6 +108,7 @@ struct SharedTrackerData {
   bool chatFilterEnabled;
   char chatFilterTerms[512];
   bool blockLinkedItems; // Block messages containing item links
+  bool useRegexFilter;   // Use regex matching instead of simple substring
 };
 
 // Tab IDs - Chat before Debug
@@ -152,6 +153,10 @@ const COLORREF CLR_GOLD = RGB(255, 215, 0);
 const COLORREF CLR_TEXT = RGB(200, 200, 200);
 const COLORREF CLR_TEXT_DIM = RGB(140, 140, 140);
 
+// Forward declarations for filter state (definitions later in file)
+static char g_filterTerms[512];
+static HWND g_hFilterEdit;
+
 // Connect to shared memory
 bool ConnectSharedMemory() {
   g_sharedMem =
@@ -170,7 +175,13 @@ bool ConnectSharedMemory() {
   // Set default filter terms if empty
   if (g_data->chatFilterTerms[0] == '\0') {
     strcpy_s(g_data->chatFilterTerms, sizeof(g_data->chatFilterTerms),
-             "wts, offer, wtb, sell, cheap, wtt, obo");
+             "wts, wtb, wtt, sell, offer, cheap, obo, \\[.*\\]");
+  }
+
+  // Sync local filter terms from shared memory
+  strcpy_s(g_filterTerms, sizeof(g_filterTerms), g_data->chatFilterTerms);
+  if (g_hFilterEdit) {
+    SetWindowTextA(g_hFilterEdit, g_filterTerms);
   }
 
   g_mutex = OpenMutexA(SYNCHRONIZE, FALSE, TRACKER_MUTEX_NAME);
@@ -195,10 +206,13 @@ void DisconnectSharedMemory() {
 // Edit control ID for filter input
 #define IDC_FILTER_EDIT 1001
 #define IDC_FILTER_APPLY 1002
+#define IDC_BLOCK_ITEMS_CHECK 1003
+#define IDC_USE_REGEX_CHECK 1004
 
 // Global edit HWND
-static HWND g_hFilterEdit = nullptr;
 static HWND g_hApplyButton = nullptr;
+static HWND g_hBlockItemsCheck = nullptr;
+static HWND g_hUseRegexCheck = nullptr;
 
 // Draw a filled rounded-ish rectangle
 void FillRoundRect(HDC hdc, RECT *r, COLORREF color) {
@@ -449,7 +463,6 @@ void DrawDebugTab(HDC hdc, int startY, RECT *rc) {
 }
 
 // Filter state (local to GUI)
-static char g_filterTerms[512] = "";
 static bool g_filterEnabled = false;
 static RECT g_toggleButtonRect = {0};
 static RECT g_applyButtonRect = {0};
@@ -461,21 +474,38 @@ void CreateFilterControls(HWND hwnd) {
   if (g_filterControlsCreated)
     return;
 
-  // Create edit control for filter terms
+  // Create edit control for filter terms - wider box
   g_hFilterEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", g_filterTerms,
                                   WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 15,
-                                  90, 200, 22, hwnd, (HMENU)IDC_FILTER_EDIT,
+                                  90, 265, 22, hwnd, (HMENU)IDC_FILTER_EDIT,
                                   GetModuleHandle(nullptr), nullptr);
 
-  // Create Apply button
+  // Create Apply button - next to edit box
   g_hApplyButton = CreateWindowExA(
-      0, "BUTTON", "Apply", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 130, 120, 60,
+      0, "BUTTON", "Apply", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 220, 115, 60,
       24, hwnd, (HMENU)IDC_FILTER_APPLY, GetModuleHandle(nullptr), nullptr);
+
+  // Create Use Regex checkbox - first checkbox
+  g_hUseRegexCheck = CreateWindowExA(
+      0, "BUTTON", "Use Regex", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 15,
+      115, 100, 20, hwnd, (HMENU)IDC_USE_REGEX_CHECK, GetModuleHandle(nullptr),
+      nullptr);
+
+  // Create Block Linked Items checkbox - second checkbox
+  g_hBlockItemsCheck = CreateWindowExA(
+      0, "BUTTON", "Block Item Links", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+      115, 115, 100, 20, hwnd, (HMENU)IDC_BLOCK_ITEMS_CHECK,
+      GetModuleHandle(nullptr), nullptr);
 
   // Set font for controls
   HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
   SendMessage(g_hFilterEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
   SendMessage(g_hApplyButton, WM_SETFONT, (WPARAM)hFont, TRUE);
+  SendMessage(g_hUseRegexCheck, WM_SETFONT, (WPARAM)hFont, TRUE);
+  SendMessage(g_hBlockItemsCheck, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+  // Set Use Regex checked by default
+  SendMessage(g_hUseRegexCheck, BM_SETCHECK, BST_CHECKED, 0);
 
   g_filterControlsCreated = true;
 }
@@ -487,6 +517,12 @@ void UpdateFilterControlsVisibility(int activeTab) {
   }
   if (g_hApplyButton) {
     ShowWindow(g_hApplyButton, activeTab == TAB_FILTER ? SW_SHOW : SW_HIDE);
+  }
+  if (g_hBlockItemsCheck) {
+    ShowWindow(g_hBlockItemsCheck, activeTab == TAB_FILTER ? SW_SHOW : SW_HIDE);
+  }
+  if (g_hUseRegexCheck) {
+    ShowWindow(g_hUseRegexCheck, activeTab == TAB_FILTER ? SW_SHOW : SW_HIDE);
   }
 }
 
@@ -527,6 +563,9 @@ void DrawFilterTab(HDC hdc, int startY, RECT *rc) {
              L"(Click to edit filters)", 23);
   }
   y += 60;
+
+  // Skip space for Win32 controls (checkboxes are at y=115)
+  y = startY + 90;
 
   // Draw ON/OFF toggle button
   COLORREF toggleColor = g_filterEnabled ? RGB(50, 180, 50) : RGB(100, 50, 50);
@@ -581,6 +620,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         InvalidateRect(hwnd, nullptr, FALSE);
       }
+      return 0;
+    }
+    if (LOWORD(wParam) == IDC_BLOCK_ITEMS_CHECK) {
+      // Toggle block linked items
+      if (g_data && g_data->magic == 0xDEADBEEF) {
+        bool checked =
+            (SendMessage(g_hBlockItemsCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        g_data->blockLinkedItems = checked;
+      }
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return 0;
+    }
+    if (LOWORD(wParam) == IDC_USE_REGEX_CHECK) {
+      // Toggle use regex filter
+      if (g_data && g_data->magic == 0xDEADBEEF) {
+        bool checked =
+            (SendMessage(g_hUseRegexCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        g_data->useRegexFilter = checked;
+      }
+      InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     }
     break;
@@ -666,6 +725,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (!g_data || g_data->magic != 0xDEADBEEF) {
       DisconnectSharedMemory();
       ConnectSharedMemory();
+    }
+    // Sync local filter terms display with shared memory
+    if (g_data && g_data->magic == 0xDEADBEEF) {
+      if (strcmp(g_filterTerms, g_data->chatFilterTerms) != 0) {
+        strcpy_s(g_filterTerms, sizeof(g_filterTerms), g_data->chatFilterTerms);
+        if (g_hFilterEdit) {
+          SetWindowTextA(g_hFilterEdit, g_filterTerms);
+        }
+      }
+      // Sync filter enabled state
+      g_filterEnabled = g_data->chatFilterEnabled;
+      // Sync block items checkbox
+      if (g_hBlockItemsCheck) {
+        SendMessage(g_hBlockItemsCheck, BM_SETCHECK,
+                    g_data->blockLinkedItems ? BST_CHECKED : BST_UNCHECKED, 0);
+      }
+      // Sync regex checkbox
+      if (g_hUseRegexCheck) {
+        SendMessage(g_hUseRegexCheck, BM_SETCHECK,
+                    g_data->useRegexFilter ? BST_CHECKED : BST_UNCHECKED, 0);
+      }
     }
     InvalidateRect(hwnd, nullptr, FALSE);
     return 0;

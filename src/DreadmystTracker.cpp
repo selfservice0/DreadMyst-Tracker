@@ -143,59 +143,10 @@ typedef void(__thiscall *OrigAddMessage_t)(void *thisPtr, const char *message,
                                            int color);
 static OrigAddMessage_t g_origAddMessage = nullptr;
 
-// Forward declaration for chat filter access (defined later with other globals)
-static SharedTrackerData *g_sharedData;
-
 // Hook function for chat messages
 void __fastcall HookedAddMessage(void *thisPtr, void *edx, const char *message,
                                  int color) {
-  // Check if chat filter is enabled
-  bool shouldFilter = false;
-  if (message && g_sharedData && g_sharedData->chatFilterEnabled &&
-      g_sharedData->chatFilterTerms[0] != '\0') {
-    // Parse comma-separated filter terms and check if message contains any
-    char filterCopy[512];
-    strncpy_s(filterCopy, sizeof(filterCopy), g_sharedData->chatFilterTerms,
-              sizeof(filterCopy) - 1);
-    filterCopy[sizeof(filterCopy) - 1] = '\0';
-
-    // Convert message to lowercase for case-insensitive matching
-    std::string msgLower(message);
-    for (auto &c : msgLower)
-      c = (char)tolower(c);
-
-    // Check each filter term
-    char *context = nullptr;
-    char *token = strtok_s(filterCopy, ",", &context);
-    while (token != nullptr) {
-      // Trim leading/trailing whitespace
-      while (*token == ' ')
-        token++;
-      char *end = token + strlen(token) - 1;
-      while (end > token && *end == ' ')
-        *end-- = '\0';
-
-      if (strlen(token) > 0) {
-        // Convert term to lowercase
-        std::string termLower(token);
-        for (auto &c : termLower)
-          c = (char)tolower(c);
-
-        if (msgLower.find(termLower) != std::string::npos) {
-          shouldFilter = true;
-          break;
-        }
-      }
-      token = strtok_s(nullptr, ",", &context);
-    }
-  }
-
-  // If message should be filtered, skip calling original (don't display it)
-  if (shouldFilter) {
-    return;
-  }
-
-  // Call original to display message
+  // Call original first so message displays
   if (g_origAddMessage) {
     g_origAddMessage(thisPtr, message, color);
   }
@@ -368,16 +319,13 @@ bool GameBridge::isInParty() {
 typedef void(__thiscall *OrigExpNotify_t)(void *thisPtr, void *data);
 typedef void(__thiscall *OrigNotifyItemAdd_t)(void *thisPtr, void *data);
 typedef void(__thiscall *OrigPkNotify_t)(void *thisPtr, void *data);
-// GameChat::recvMsg(const string& msg, const string& from, Channels c,
-// ItemDefinition* linkedItem)
-typedef void(__thiscall *OrigRecvMsg_t)(void *thisPtr, void *msgStr,
-                                        void *fromStr, int channel,
-                                        void *linkedItem);
+typedef void(__thiscall *OrigAddLine_t)(void *thisPtr, void *strBuf,
+                                        int channel, void *linkedItem);
 
 static OrigExpNotify_t g_origExpNotify = nullptr;
 static OrigNotifyItemAdd_t g_origNotifyItemAdd = nullptr;
 static OrigPkNotify_t g_origPkNotify = nullptr;
-static OrigRecvMsg_t g_origRecvMsg = nullptr;
+static OrigAddLine_t g_origAddLine = nullptr;
 
 // Discovered function addresses from Dreadmyst.exe analysis:
 // Game::processPacket_Server_ExpNotify at VA 0x0045E320
@@ -388,10 +336,21 @@ static constexpr DWORD ITEM_NOTIFY_VA = 0x004673C0;
 static constexpr DWORD PK_NOTIFY_VA = 0x0045DE50;
 // Game::processPacket_Server_SpentGold at VA 0x0045EDD0
 static constexpr DWORD GOLD_NOTIFY_VA = 0x0045EDD0;
-// GameChat::recvMsg (FUN_00471e60) - for chat filtering
-static constexpr DWORD RECVMSG_VA = 0x00471e60;
+// GameChat::addLine (FUN_00472ac0) - for parsing exp from chat strings
+static constexpr DWORD ADDLINE_VA = 0x00472ac0;
 // Game::processPacket_Server_CombatMsg at VA 0x00468110 - for DPS tracking
 static constexpr DWORD COMBAT_MSG_VA = 0x00468110;
+// GameChat::recvMsg (FUN_00471e60) - for chat filtering
+static constexpr DWORD RECVMSG_VA = 0x00471e60;
+
+// RecvMsg hook for chat filtering
+typedef void(__thiscall *OrigRecvMsg_t)(void *thisPtr, void *msgStr,
+                                        void *fromStr, int channel,
+                                        void *linkedItem);
+static OrigRecvMsg_t g_origRecvMsg = nullptr;
+
+// Forward declaration for chat filter access
+static SharedTrackerData *g_sharedData = nullptr;
 
 // Static tracker reference for hooks (Must be declared before hooks)
 static Tracker *g_trackerInstance = nullptr;
@@ -415,48 +374,33 @@ void __fastcall HookedSpentGold(void *thisPtr, void *edx, void *data) {
 typedef void(__thiscall *OrigCombatMsg_t)(void *thisPtr, void *data);
 static OrigCombatMsg_t g_origCombatMsg = nullptr;
 
-// StlBuffer is a class that wraps packet data. Common layout:
-// struct StlBuffer {
-//   char* m_data;      // offset 0: pointer to raw data
-//   size_t m_readPos;  // offset 4: current read position
-//   size_t m_size;     // offset 8: total size
-// };
-// GP_Server_CombatMsg packet fields (after unpacking):
-// - m_targetGuid (int32)
-// - m_casterGuid (int32)
-// - m_amount (int32) - negative = damage
-// - m_spellId (uint16)
-// - m_spellEffect (uint8)
-// - m_spellResult (uint8)
-// - etc...
-
-// Debug counter for combat events
-static int g_combatMsgCount = 0;
-// Debug buffer for packet data
-static char g_combatDebug[512] = "No combat yet";
-// Player GUID for filtering (0 = not yet captured)
-static int32_t g_playerGuid = 0;
-
+// Combat message packet structure (simplified, based on game source)
+// The packet contains: targetGuid, casterGuid, amount, spellId, etc.
+// We read the amount from the packet data buffer
 void __fastcall HookedCombatMsg(void *thisPtr, void *edx, void *data) {
-  g_combatMsgCount++;
-
-  if (data) {
-    // Dump first 32 bytes of data as hex to understand structure
-    uint8_t *bytes = (uint8_t *)data;
-    _snprintf_s(g_combatDebug, sizeof(g_combatDebug), _TRUNCATE,
-                "Cnt:%d %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X "
-                "%02X%02X%02X%02X",
-                g_combatMsgCount, bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
-                bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
-                bytes[15]);
-
-    // Don't try to extract damage yet - we need to see the hex first
-  }
-
-  // Call original
+  // Call original first
   if (g_origCombatMsg) {
     g_origCombatMsg(thisPtr, data);
+  }
+
+  // Parse damage from the packet data
+  // The packet structure GP_Server_CombatMsg has m_amount at a certain offset
+  // Based on source: m_targetGuid (4), m_casterGuid (4), m_amount (4), etc.
+  // We check if we're the caster and damage is negative (dealt damage)
+  if (data && g_trackerInstance) {
+    // Packet layout (approximate from game source analysis):
+    // Offset 0: targetGuid (int32)
+    // Offset 4: casterGuid (int32)
+    // Offset 8: amount (int32) - negative = damage, positive = heal
+    // This is a simplification - actual offsets may differ
+    int32_t *packetData = (int32_t *)data;
+    int32_t amount = packetData[2]; // Approximate offset for m_amount
+
+    // If amount is negative, it's damage dealt
+    if (amount < 0) {
+      int damage = -amount;
+      g_trackerInstance->notifyDamageDealt(damage);
+    }
   }
 }
 
@@ -477,99 +421,213 @@ void __fastcall HookedExpNotify(void *thisPtr, void *edx, void *data) {
   }
 }
 
-// Hook for GameChat::recvMsg - filters chat messages before display
-void __fastcall HookedRecvMsg(void *thisPtr, void *edx, void *msgStr,
-                              void *fromStr, int channel, void *linkedItem) {
-  // Debug: track filter state
-  static int filterCheckCount = 0;
-  filterCheckCount++;
+// Hook for GameChat::addLine - parses exp from chat strings
+void __fastcall HookedAddLine(void *thisPtr, void *edx, void *strBuf,
+                              int channel, void *linkedItem) {
+  // Call original first
+  if (g_origAddLine) {
+    g_origAddLine(thisPtr, strBuf, channel, linkedItem);
+  }
 
-  // Always call original first to ensure game stability
-  // We check shouldBlock first, then decide whether to call
-  bool shouldBlock = false;
+  // Try to extract string from the std::string buffer
+  // std::string layout: [ptr_or_sso][size][capacity] or SSO inline
+  // For SSO: if capacity < 16, string is inline at start of object
+  if (strBuf) {
+    char *strPtr = nullptr;
 
-  __try {
-    // Check if chat filter is enabled and has terms
-    bool filterEnabled = (g_sharedData && g_sharedData->chatFilterEnabled &&
-                          g_sharedData->chatFilterTerms[0] != '\0');
+    // SSO threshold is typically 15 chars. Check the capacity field.
+    uint32_t *ssoBuf = (uint32_t *)strBuf;
+    uint32_t capacity = ssoBuf[5]; // capacity is at offset 20 (5 * 4)
 
-    if (filterEnabled && msgStr) {
-      // Safely extract string - use SEH to catch any access violations
-      char *strPtr = nullptr;
+    if (capacity < 16) {
+      // SSO: string is inline at the start of the buffer
+      strPtr = (char *)strBuf;
+    } else {
+      // Heap allocated: first pointer is the string data
+      strPtr = *(char **)strBuf;
+    }
 
-      // Check if SSO (small string optimization) or heap allocated
-      // MSVC std::string layout: if capacity < 16, string is inline (SSO)
-      uint32_t *ssoBuf = (uint32_t *)msgStr;
-      uint32_t capacity = ssoBuf[5]; // capacity at offset 20
+    if (strPtr && (uintptr_t)strPtr > 0x10000 &&
+        (uintptr_t)strPtr < 0x7FFFFFFF) {
+      // Check for exp message: "You gained X experience"
+      if (strstr(strPtr, "You gained") && strstr(strPtr, "experience")) {
+        // Parse the number: "You gained %d experience"
+        int expAmount = 0;
+        const char *numStart = strPtr + 11; // Skip "You gained "
+        while (*numStart && (*numStart < '0' || *numStart > '9'))
+          numStart++;
+        while (*numStart >= '0' && *numStart <= '9') {
+          expAmount = expAmount * 10 + (*numStart - '0');
+          numStart++;
+        }
 
-      if (capacity < 16) {
-        strPtr = (char *)msgStr; // SSO inline buffer
-      } else {
-        strPtr = *(char **)msgStr; // Heap pointer at offset 0
+        if (expAmount > 0 && g_trackerInstance) {
+          g_trackerInstance->notifyExpGained(expAmount);
+          sprintf(g_debugText, "Exp gained: %d\nTotal events: %d", expAmount,
+                  g_expEventCount);
+        }
       }
 
-      // Validate pointer before use
-      if (strPtr && (uintptr_t)strPtr > 0x10000 &&
-          (uintptr_t)strPtr < 0x7FFFFFFF) {
-        // Convert message to lowercase for case-insensitive matching
-        char msgLower[512];
-        strncpy_s(msgLower, sizeof(msgLower), strPtr, sizeof(msgLower) - 1);
-        msgLower[sizeof(msgLower) - 1] = '\0';
-        for (char *p = msgLower; *p; p++)
-          *p = (char)tolower(*p);
+      // Check for loot message: "You receive: [ItemName]" or "[Player]
+      // received: [ItemName]"
+      const char *receivePos = strstr(strPtr, "receive: [");
+      if (receivePos && g_trackerInstance) {
+        // Find the brackets to extract item name
+        const char *nameStart = strstr(receivePos, "[");
+        const char *nameEnd = strstr(nameStart ? nameStart + 1 : nullptr, "]");
 
-        // Parse comma-separated filter terms
-        char filterCopy[512];
-        strncpy_s(filterCopy, sizeof(filterCopy), g_sharedData->chatFilterTerms,
-                  sizeof(filterCopy) - 1);
-        filterCopy[sizeof(filterCopy) - 1] = '\0';
+        if (nameStart && nameEnd && nameEnd > nameStart) {
+          nameStart++; // Skip [
+          char itemName[64] = {0};
+          int len = (int)(nameEnd - nameStart);
+          if (len > 63)
+            len = 63;
+          strncpy(itemName, nameStart, len);
+          itemName[len] = '\0';
 
-        char *context = nullptr;
-        char *token = strtok_s(filterCopy, ",", &context);
-        while (token != nullptr) {
-          // Trim whitespace
-          while (*token == ' ')
-            token++;
-          char *end = token + strlen(token) - 1;
-          while (end > token && *end == ' ')
-            *end-- = '\0';
-
-          if (strlen(token) > 0) {
-            // Convert term to lowercase
-            char termLower[64];
-            strncpy_s(termLower, sizeof(termLower), token,
-                      sizeof(termLower) - 1);
-            termLower[sizeof(termLower) - 1] = '\0';
-            for (char *p = termLower; *p; p++)
-              *p = (char)tolower(*p);
-
-            if (strstr(msgLower, termLower) != nullptr) {
-              shouldBlock = true;
-              break;
-            }
+          // Check for amount " xN" after the ]
+          int amount = 1;
+          const char *amtPos = strstr(nameEnd, " x");
+          if (amtPos) {
+            amount = atoi(amtPos + 2);
+            if (amount < 1)
+              amount = 1;
           }
-          token = strtok_s(nullptr, ",", &context);
+
+          // Check if it's gold
+          if (strstr(itemName, "Gold") || strstr(itemName, "gold")) {
+            g_trackerInstance->notifyGoldChanged(amount);
+            sprintf(g_debugText, "Gold: +%d\nExp events: %d", amount,
+                    g_expEventCount);
+          } else {
+            LootEntry entry;
+            entry.item.m_itemId = 0;
+            entry.itemName = itemName;
+            entry.quality = ItemQuality::QualityLv1;
+            entry.amount = amount;
+            g_trackerInstance->notifyLootReceived(entry);
+            sprintf(g_debugText, "Loot: %s x%d\nExp events: %d", itemName,
+                    amount, g_expEventCount);
+          }
+        }
+      }
+
+      // Check for gold spent: "You spent X Gold"
+      const char *spentPos = strstr(strPtr, "You spent ");
+      if (spentPos && strstr(spentPos, " Gold") && g_trackerInstance) {
+        int goldSpent = atoi(spentPos + 10); // Skip "You spent "
+        if (goldSpent > 0) {
+          g_trackerInstance->notifyGoldSpent(goldSpent);
+          sprintf(g_debugText, "Gold spent: -%d\nExp: %d", goldSpent,
+                  g_expEventCount);
         }
       }
     }
+  }
+}
 
-    // Write debug info
-    sprintf_s(g_debugText, sizeof(g_debugText),
-              "Filter: %s, Block: %s, Checks: %d",
-              (g_sharedData && g_sharedData->chatFilterEnabled) ? "ON" : "OFF",
-              shouldBlock ? "YES" : "NO", filterCheckCount);
+// Hook for GameChat::recvMsg - filters chat messages before display
+void __fastcall HookedRecvMsg(void *thisPtr, void *edx, void *msgStr,
+                              void *fromStr, int channel, void *linkedItem) {
+  bool shouldBlock = false;
+
+  __try {
+    if (g_sharedData && g_sharedData->chatFilterEnabled) {
+
+      // Check for linked item blocking
+      if (g_sharedData->blockLinkedItems && linkedItem != nullptr) {
+        shouldBlock = true;
+      }
+
+      // Check filter terms if we have any and haven't already decided to block
+      if (!shouldBlock && g_sharedData->chatFilterTerms[0] != '\0' && msgStr) {
+        char *strPtr = nullptr;
+        uint32_t *ssoBuf = (uint32_t *)msgStr;
+        uint32_t capacity = ssoBuf[5];
+
+        if (capacity < 16) {
+          strPtr = (char *)msgStr;
+        } else {
+          strPtr = *(char **)msgStr;
+        }
+
+        if (strPtr && (uintptr_t)strPtr > 0x10000 &&
+            (uintptr_t)strPtr < 0x7FFFFFFF) {
+
+          // Also block if message contains item brackets and blockLinkedItems
+          // is on
+          if (g_sharedData->blockLinkedItems &&
+              strchr(strPtr, '[') != nullptr) {
+            shouldBlock = true;
+          }
+
+          // Check custom filter terms
+          if (!shouldBlock) {
+            char msgLower[512];
+            strncpy_s(msgLower, sizeof(msgLower), strPtr, sizeof(msgLower) - 1);
+            for (char *p = msgLower; *p; p++)
+              *p = (char)tolower(*p);
+
+            char filterCopy[512];
+            strncpy_s(filterCopy, sizeof(filterCopy),
+                      g_sharedData->chatFilterTerms, sizeof(filterCopy) - 1);
+
+            char *context = nullptr;
+            char *token = strtok_s(filterCopy, ",", &context);
+            while (token != nullptr) {
+              while (*token == ' ')
+                token++;
+              char *end = token + strlen(token) - 1;
+              while (end > token && *end == ' ')
+                *end-- = '\0';
+
+              if (strlen(token) > 0) {
+                char termLower[64];
+                strncpy_s(termLower, sizeof(termLower), token,
+                          sizeof(termLower) - 1);
+                for (char *p = termLower; *p; p++)
+                  *p = (char)tolower(*p);
+
+                if (strstr(msgLower, termLower) != nullptr) {
+                  shouldBlock = true;
+                  break;
+                }
+              }
+              token = strtok_s(nullptr, ",", &context);
+            }
+          }
+        }
+      }
+
+      // If blockLinkedItems is on but no filter terms, still check for brackets
+      if (!shouldBlock && g_sharedData->blockLinkedItems &&
+          g_sharedData->chatFilterTerms[0] == '\0' && msgStr) {
+        char *strPtr = nullptr;
+        uint32_t *ssoBuf = (uint32_t *)msgStr;
+        uint32_t capacity = ssoBuf[5];
+
+        if (capacity < 16) {
+          strPtr = (char *)msgStr;
+        } else {
+          strPtr = *(char **)msgStr;
+        }
+
+        if (strPtr && (uintptr_t)strPtr > 0x10000 &&
+            (uintptr_t)strPtr < 0x7FFFFFFF) {
+          if (strchr(strPtr, '[') != nullptr) {
+            shouldBlock = true;
+          }
+        }
+      }
+    }
   } __except (EXCEPTION_EXECUTE_HANDLER) {
-    // On any exception, don't block - let original handle it
     shouldBlock = false;
-    sprintf_s(g_debugText, sizeof(g_debugText), "Filter: EXCEPTION caught");
   }
 
-  // If message matches filter, block it
   if (shouldBlock) {
     return; // Don't call original - block message
   }
 
-  // Call original to display message
   if (g_origRecvMsg) {
     g_origRecvMsg(thisPtr, msgStr, fromStr, channel, linkedItem);
   }
@@ -650,18 +708,11 @@ bool EventHooks::install() {
     s_origNotifyItemAdd = (void *)g_origNotifyItemAdd;
   }
 
-  // Create hook for GameChat::recvMsg - for chat filtering
-  void *recvMsgAddr = (void *)(moduleBase + (RECVMSG_VA - 0x00400000));
-  MH_STATUS recvMsgStatus =
-      MH_CreateHook(recvMsgAddr, (LPVOID)&HookedRecvMsg,
-                    reinterpret_cast<LPVOID *>(&g_origRecvMsg));
-  if (recvMsgStatus == MH_OK) {
-    MH_EnableHook(recvMsgAddr);
-    sprintf_s(g_debugText, sizeof(g_debugText), "RecvMsg hook OK at %p",
-              recvMsgAddr);
-  } else {
-    sprintf_s(g_debugText, sizeof(g_debugText), "RecvMsg hook FAILED: %d at %p",
-              recvMsgStatus, recvMsgAddr);
+  // Create hook for GameChat::addLine - parses exp from chat strings
+  void *addLineAddr = (void *)(moduleBase + (ADDLINE_VA - 0x00400000));
+  if (MH_CreateHook(addLineAddr, (LPVOID)&HookedAddLine,
+                    reinterpret_cast<LPVOID *>(&g_origAddLine)) == MH_OK) {
+    MH_EnableHook(addLineAddr);
   }
 
   // Create hook for CombatMsg - for DPS tracking
@@ -670,6 +721,13 @@ bool EventHooks::install() {
                     reinterpret_cast<LPVOID *>(&g_origCombatMsg)) == MH_OK) {
     MH_EnableHook(combatMsgAddr);
     s_origCombatMsg = (void *)g_origCombatMsg;
+  }
+
+  // Create hook for GameChat::recvMsg - for chat filtering
+  void *recvMsgAddr = (void *)(moduleBase + (RECVMSG_VA - 0x00400000));
+  if (MH_CreateHook(recvMsgAddr, (LPVOID)&HookedRecvMsg,
+                    reinterpret_cast<LPVOID *>(&g_origRecvMsg)) == MH_OK) {
+    MH_EnableHook(recvMsgAddr);
   }
 
   m_installed = true;
@@ -1035,11 +1093,9 @@ void Tracker::updateSharedMemory() {
 
   m_sharedData->overlayVisible = m_overlayVisible;
 
-  // Copy debug text (combine regular and combat debug)
+  // Copy debug text
   extern char g_debugText[512];
-  extern char g_combatDebug[512];
-  _snprintf_s(m_sharedData->debugText, sizeof(m_sharedData->debugText),
-              _TRUNCATE, "%s\n%s", g_debugText, g_combatDebug);
+  memcpy(m_sharedData->debugText, g_debugText, sizeof(g_debugText));
 
   // Sync recent loot entries (last 10)
   int lootCount = (int)m_lootHistory.size();
