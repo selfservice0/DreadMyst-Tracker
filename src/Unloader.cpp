@@ -91,32 +91,19 @@ int wmain(int argc, wchar_t *argv[]) {
 
   std::wcout << L"Found! PID: " << pid << L"\n";
 
-  // List of DLLs to try unloading
-  std::vector<std::wstring> dlls = {
-      L"DreadmystTracker.dll",  L"DreadmystTracker1.dll",
-      L"DreadmystTracker2.dll", L"DreadmystTracker3.dll",
-      L"DreadmystTracker4.dll", L"DreadmystTracker5.dll",
-      L"DreadmystTracker6.dll"};
+  // Unload DreadmystTracker.dll
+  const wchar_t *dllName = L"DreadmystTracker.dll";
+  HMODULE hModule = FindModule(pid, dllName);
 
-  bool anyUnloaded = false;
-
-  for (const auto &dllName : dlls) {
-    HMODULE hModule = FindModule(pid, dllName.c_str());
-    if (hModule) {
-      std::wcout << L"Found " << dllName << L". Unloading...\n";
-      if (Unload(pid, hModule)) {
-        std::wcout << L"SUCCESS! " << dllName << L" unloaded!\n";
-        anyUnloaded = true;
-      } else {
-        std::wcerr << L"FAILED to unload " << dllName << L"\n";
-      }
+  if (hModule) {
+    std::wcout << L"Found " << dllName << L". Unloading...\n";
+    if (Unload(pid, hModule)) {
+      std::wcout << L"SUCCESS! " << dllName << L" unloaded!\n";
+    } else {
+      std::wcerr << L"FAILED to unload " << dllName << L"\n";
     }
-  }
-
-  if (!anyUnloaded) {
-    std::wcout << L"No Dreadmyst Tracker DLLs were found injected.\n";
   } else {
-    std::wcout << L"\nCleanup complete.\n";
+    std::wcout << L"DreadmystTracker.dll not found injected.\n";
   }
 
   return 0;

@@ -104,15 +104,19 @@ struct SharedTrackerData {
   bool overlayVisible;
   int64_t sessionStartTime;
   char debugText[512];
+  // Chat filter settings
+  bool chatFilterEnabled;
+  char chatFilterTerms[512];
+  bool blockLinkedItems; // Block messages containing item links
 };
 
-// Tab IDs
-enum Tab { TAB_STATS = 0, TAB_LOOT = 1, TAB_DEBUG = 2 };
+// Tab IDs - Chat before Debug
+enum Tab { TAB_STATS = 0, TAB_LOOT = 1, TAB_FILTER = 2, TAB_DEBUG = 3 };
 static int g_activeTab = TAB_STATS;
 static int g_hoverTab = -1;
 
 // Tab button rectangles
-static RECT g_tabRects[3];
+static RECT g_tabRects[4];
 
 // Global state
 HWND g_hwnd = nullptr;
@@ -151,16 +155,22 @@ const COLORREF CLR_TEXT_DIM = RGB(140, 140, 140);
 // Connect to shared memory
 bool ConnectSharedMemory() {
   g_sharedMem =
-      OpenFileMappingA(FILE_MAP_READ, FALSE, TRACKER_SHARED_MEMORY_NAME);
+      OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, TRACKER_SHARED_MEMORY_NAME);
   if (!g_sharedMem)
     return false;
 
   g_data = static_cast<SharedTrackerData *>(MapViewOfFile(
-      g_sharedMem, FILE_MAP_READ, 0, 0, sizeof(SharedTrackerData)));
+      g_sharedMem, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedTrackerData)));
   if (!g_data) {
     CloseHandle(g_sharedMem);
     g_sharedMem = nullptr;
     return false;
+  }
+
+  // Set default filter terms if empty
+  if (g_data->chatFilterTerms[0] == '\0') {
+    strcpy_s(g_data->chatFilterTerms, sizeof(g_data->chatFilterTerms),
+             "wts, offer, wtb, sell, cheap, wtt, obo");
   }
 
   g_mutex = OpenMutexA(SYNCHRONIZE, FALSE, TRACKER_MUTEX_NAME);
@@ -181,6 +191,14 @@ void DisconnectSharedMemory() {
     g_mutex = nullptr;
   }
 }
+
+// Edit control ID for filter input
+#define IDC_FILTER_EDIT 1001
+#define IDC_FILTER_APPLY 1002
+
+// Global edit HWND
+static HWND g_hFilterEdit = nullptr;
+static HWND g_hApplyButton = nullptr;
 
 // Draw a filled rounded-ish rectangle
 void FillRoundRect(HDC hdc, RECT *r, COLORREF color) {
@@ -299,17 +317,9 @@ void DrawStatsTab(HDC hdc, int startY, RECT *rc) {
     double xpPerHour =
         g_data->totalExp / (sessionHr > 0.001 ? sessionHr : 0.001);
 
-    // Use actual damage if tracked, otherwise estimate from XP
-    double dps = 0;
-    double dph = 0;
-    if (g_data->totalDamage > 0) {
-      dps = g_data->totalDamage / sessionSec;
-      dph = dps * 3600.0;
-    } else {
-      // Estimate: XP/sec as rough DPS proxy
-      dps = g_data->totalExp / sessionSec;
-      dph = dps * 3600.0;
-    }
+    // DPS from actual damage only (no XP fallback)
+    double dps = g_data->totalDamage / sessionSec;
+    double dph = dps * 3600.0;
 
     SetTextColor(hdc, RGB(150, 200, 255));
     _snwprintf_s(buf, 256, _TRUNCATE, L"%.1f kills/min  |  %.0f xp/hr",
@@ -317,16 +327,10 @@ void DrawStatsTab(HDC hdc, int startY, RECT *rc) {
     TextOutW(hdc, 15, y, buf, (int)wcslen(buf));
     y += 18;
 
-    // DPS display - show estimated if no actual damage tracked
+    // DPS display - always show DPS, with 0 if no damage tracked
     SetTextColor(hdc, RGB(255, 150, 50)); // Orange for DPS
-    if (g_data->totalDamage > 0) {
-      _snwprintf_s(buf, 256, _TRUNCATE, L"DPS: %.1f  |  %.0f/hr", dps, dph);
-    } else {
-      // Show XP per minute for better readability (XP/s is often < 1)
-      double xpPerMin = dps * 60.0;
-      _snwprintf_s(buf, 256, _TRUNCATE, L"XP/min: %.1f  |  %.0f/hr", xpPerMin,
-                   dph);
-    }
+    _snwprintf_s(buf, 256, _TRUNCATE, L"DPS: %.1f  |  Dmg: %I64d", dps,
+                 g_data->totalDamage);
     TextOutW(hdc, 15, y, buf, (int)wcslen(buf));
     y += 18;
     y += 6;
@@ -444,9 +448,143 @@ void DrawDebugTab(HDC hdc, int startY, RECT *rc) {
   }
 }
 
+// Filter state (local to GUI)
+static char g_filterTerms[512] = "";
+static bool g_filterEnabled = false;
+static RECT g_toggleButtonRect = {0};
+static RECT g_applyButtonRect = {0};
+static HWND g_filterEditHwnd = nullptr;
+static bool g_filterControlsCreated = false;
+
+// Create filter controls on the window
+void CreateFilterControls(HWND hwnd) {
+  if (g_filterControlsCreated)
+    return;
+
+  // Create edit control for filter terms
+  g_hFilterEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", g_filterTerms,
+                                  WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 15,
+                                  90, 200, 22, hwnd, (HMENU)IDC_FILTER_EDIT,
+                                  GetModuleHandle(nullptr), nullptr);
+
+  // Create Apply button
+  g_hApplyButton = CreateWindowExA(
+      0, "BUTTON", "Apply", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 130, 120, 60,
+      24, hwnd, (HMENU)IDC_FILTER_APPLY, GetModuleHandle(nullptr), nullptr);
+
+  // Set font for controls
+  HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+  SendMessage(g_hFilterEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+  SendMessage(g_hApplyButton, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+  g_filterControlsCreated = true;
+}
+
+// Show/hide filter controls based on active tab
+void UpdateFilterControlsVisibility(int activeTab) {
+  if (g_hFilterEdit) {
+    ShowWindow(g_hFilterEdit, activeTab == TAB_FILTER ? SW_SHOW : SW_HIDE);
+  }
+  if (g_hApplyButton) {
+    ShowWindow(g_hApplyButton, activeTab == TAB_FILTER ? SW_SHOW : SW_HIDE);
+  }
+}
+
+// Draw Filter tab content
+void DrawFilterTab(HDC hdc, int startY, RECT *rc) {
+  int y = startY;
+
+  // Create regular content font
+  HFONT contentFont =
+      CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                  0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+  SelectObject(hdc, contentFont);
+
+  SetTextColor(hdc, CLR_TEXT);
+  TextOutW(hdc, 15, y, L"Filter Terms (comma-separated):", 32);
+  y += 20;
+
+  // Draw text input area background
+  RECT editRect = {15, y, rc->right - 15, y + 50};
+  FillRoundRect(hdc, &editRect, RGB(30, 30, 50));
+  HPEN borderPen = CreatePen(PS_SOLID, 1, CLR_BORDER);
+  SelectObject(hdc, borderPen);
+  SelectObject(hdc, GetStockObject(NULL_BRUSH));
+  Rectangle(hdc, editRect.left, editRect.top, editRect.right, editRect.bottom);
+  DeleteObject(borderPen);
+
+  // Display current filter terms
+  if (g_filterTerms[0]) {
+    wchar_t wTerms[512];
+    MultiByteToWideChar(CP_ACP, 0, g_filterTerms, -1, wTerms, 512);
+    SetTextColor(hdc, CLR_TEXT);
+    RECT textRect = {editRect.left + 5, editRect.top + 5, editRect.right - 5,
+                     editRect.bottom - 5};
+    DrawTextW(hdc, wTerms, -1, &textRect, DT_LEFT | DT_TOP | DT_WORDBREAK);
+  } else {
+    SetTextColor(hdc, CLR_TEXT_DIM);
+    TextOutW(hdc, editRect.left + 5, editRect.top + 5,
+             L"(Click to edit filters)", 23);
+  }
+  y += 60;
+
+  // Draw ON/OFF toggle button
+  COLORREF toggleColor = g_filterEnabled ? RGB(50, 180, 50) : RGB(100, 50, 50);
+  const wchar_t *toggleText =
+      g_filterEnabled ? L"  FILTER ON" : L"  FILTER OFF";
+  g_toggleButtonRect = {15, y, 120, y + 30};
+  FillRoundRect(hdc, &g_toggleButtonRect, toggleColor);
+
+  // Button border
+  borderPen = CreatePen(PS_SOLID, 1,
+                        g_filterEnabled ? RGB(80, 220, 80) : RGB(150, 80, 80));
+  SelectObject(hdc, borderPen);
+  Rectangle(hdc, g_toggleButtonRect.left, g_toggleButtonRect.top,
+            g_toggleButtonRect.right, g_toggleButtonRect.bottom);
+  DeleteObject(borderPen);
+
+  // Button text
+  SetTextColor(hdc, RGB(255, 255, 255));
+  DrawTextW(hdc, toggleText, -1, &g_toggleButtonRect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+  y += 40;
+
+  // Status
+  SetTextColor(hdc, CLR_TEXT_DIM);
+  if (g_data && g_data->magic == 0xDEADBEEF) {
+    TextOutW(hdc, 15, y, L"Connected to game", 17);
+  } else {
+    TextOutW(hdc, 15, y, L"Waiting for game...", 19);
+  }
+
+  DeleteObject(contentFont);
+}
+
 // Window procedure
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   switch (msg) {
+  case WM_CREATE:
+    CreateFilterControls(hwnd);
+    UpdateFilterControlsVisibility(g_activeTab);
+    return 0;
+
+  case WM_COMMAND:
+    if (LOWORD(wParam) == IDC_FILTER_APPLY) {
+      // Get text from edit control
+      if (g_hFilterEdit) {
+        GetWindowTextA(g_hFilterEdit, g_filterTerms, sizeof(g_filterTerms));
+
+        // Update shared memory
+        if (g_data && g_data->magic == 0xDEADBEEF) {
+          strcpy_s(g_data->chatFilterTerms, g_filterTerms);
+        }
+
+        InvalidateRect(hwnd, nullptr, FALSE);
+      }
+      return 0;
+    }
+    break;
+
   case WM_PAINT: {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
@@ -480,18 +618,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     TextOutW(hdc, 12, 7, L"Dreadmyst Tracker", 17);
     DeleteObject(titleFont);
 
-    // Tab buttons
-    HFONT tabFont =
-        CreateFontW(12, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                    DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    // Tab buttons - use Segoe UI Symbol for icon support
+    HFONT tabFont = CreateFontW(12, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                                DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0,
+                                L"Segoe UI Symbol");
     SelectObject(hdc, tabFont);
 
-    int tabW = 70;
-    int tabH = 22;
+    int tabW = 65;
+    int tabH = 24;
     int tabY = 38;
-    DrawTab(hdc, TAB_STATS, L"Stats", 10, tabY, tabW, tabH);
-    DrawTab(hdc, TAB_LOOT, L"Loot", 85, tabY, tabW, tabH);
-    DrawTab(hdc, TAB_DEBUG, L"Debug", 160, tabY, tabW, tabH);
+    DrawTab(hdc, TAB_STATS, L"\x2694 Stats", 10, tabY, tabW,
+            tabH); // Crossed swords
+    DrawTab(hdc, TAB_LOOT, L"\x2666 Loot", 80, tabY, tabW, tabH);    // Diamond
+    DrawTab(hdc, TAB_FILTER, L"\x2709 Chat", 150, tabY, tabW, tabH); // Envelope
+    DrawTab(hdc, TAB_DEBUG, L"\x2699 Debug", 220, tabY, tabW, tabH); // Gear
     DeleteObject(tabFont);
 
     // Content area
@@ -511,6 +651,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       break;
     case TAB_DEBUG:
       DrawDebugTab(hdc, contentY, &rc);
+      break;
+    case TAB_FILTER:
+      DrawFilterTab(hdc, contentY, &rc);
       break;
     }
 
@@ -532,7 +675,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     // Check tab hover
     int newHover = -1;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
       if (PtInRect(&g_tabRects[i], pt)) {
         newHover = i;
         break;
@@ -558,10 +701,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     POINT pt = {LOWORD(lParam), HIWORD(lParam)};
 
     // Check tab click
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
       if (PtInRect(&g_tabRects[i], pt)) {
         g_activeTab = i;
+        UpdateFilterControlsVisibility(g_activeTab);
         InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+    }
+
+    // Filter tab click handling
+    if (g_activeTab == TAB_FILTER) {
+      // Check toggle button click
+      if (PtInRect(&g_toggleButtonRect, pt)) {
+        g_filterEnabled = !g_filterEnabled;
+        // Update shared memory
+        if (g_data && g_data->magic == 0xDEADBEEF) {
+          g_data->chatFilterEnabled = g_filterEnabled;
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+
+      // Check filter text area click - focus the edit control
+      if (pt.y >= 90 && pt.y <= 140 && g_hFilterEdit) {
+        SetFocus(g_hFilterEdit);
         return 0;
       }
     }
@@ -690,7 +854,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   g_hwnd =
       CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
                       L"DreadmystTrackerGUI", L"Dreadmyst Tracker", WS_POPUP,
-                      100, 100, 250, 320, nullptr, nullptr, hInstance, nullptr);
+                      100, 100, 300, 380, nullptr, nullptr, hInstance, nullptr);
 
   if (!g_hwnd)
     return 1;
