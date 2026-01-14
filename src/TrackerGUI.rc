@@ -1,0 +1,8 @@
+// TrackerGUI Resources - Embeds DLL and tools
+#include "resource.h"
+
+// Embed the DLL and executables as binary resources
+// These paths are relative to the rc file location
+IDR_DLL_TRACKER    RT_BINARY_DATA    "..\\bin\\Win32\\Debug\\DreadmystTracker.dll"
+IDR_EXE_INJECTOR   RT_BINARY_DATA    "..\\bin\\Win32\\Debug\\Injector.exe"
+IDR_EXE_UNLOADER   RT_BINARY_DATA    "..\\bin\\Win32\\Debug\\Unloader.exe"
