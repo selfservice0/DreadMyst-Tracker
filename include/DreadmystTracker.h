@@ -58,6 +58,13 @@ struct SharedTrackerData {
   // Session start time
   int64_t sessionStartTime{0};
 
+  // Combat DPS tracking
+  int64_t combatStartTime{0}; // When current combat started (ms since epoch)
+  int64_t combatDamage{0};    // Damage dealt in current combat
+  int64_t lastDamageTime{0};  // When last damage was dealt (for timeout)
+  double lastCombatDPS{0.0};  // DPS from last completed combat
+  bool inCombat{false};       // Currently in combat
+
   // Debug text for displaying probed buffer values
   char debugText[512]{};
 
@@ -66,6 +73,9 @@ struct SharedTrackerData {
   char chatFilterTerms[512]{};  // Comma-separated filter terms
   bool blockLinkedItems{false}; // Block messages containing item links
   bool useRegexFilter{false}; // Use regex matching instead of simple substring
+
+  // Anti-AFK settings
+  bool antiAfkEnabled{false}; // Periodically send input to prevent AFK kick
 };
 
 namespace DreadmystTracker {

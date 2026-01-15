@@ -136,6 +136,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\DreadmystTracker.cpp" />
+    <!-- ANTI-AFK DISABLED - Uncomment to enable -->
+    <!-- <ClCompile Include="src\AntiAfk.cpp" /> -->
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\DreadmystTracker.h" />
